@@ -99,15 +99,11 @@ jobs:
     - name: Add targets
       run: rustup target add x86_64-pc-windows-msvc && rustup target add i686-pc-windows-msvc
     - name: Build 64-bit
-      run: |
-        set RUSTFLAGS=-C print-link-args
-        cargo build --release --target x86_64-pc-windows-msvc --verbose
+      run: cargo build --release --target x86_64-pc-windows-msvc --verbose
       env:
         RUSTFLAGS: -Ctarget-feature=+crt-static
     - name: Build 32-bit
-      run: |
-        set RUSTFLAGS=-C print-link-args
-        cargo build --release --target i686-pc-windows-msvc --verbose
+      run: cargo build --release --target i686-pc-windows-msvc --verbose
       env:
         RUSTFLAGS: -Ctarget-feature=+crt-static
     - name: Rename binaries
