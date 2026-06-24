@@ -101,11 +101,11 @@ jobs:
     - name: Build 64-bit
       run: cargo build --release --target x86_64-pc-windows-msvc --verbose
       env:
-        RUSTFLAGS: -Ctarget-feature=+crt-static
+        RUSTFLAGS: -Ctarget-feature=+crt-static -Cprint-link-args
     - name: Build 32-bit
       run: cargo build --release --target i686-pc-windows-msvc --verbose
       env:
-        RUSTFLAGS: -Ctarget-feature=+crt-static
+        RUSTFLAGS: -Ctarget-feature=+crt-static -Cprint-link-args
     - name: Rename binaries
       run: |
         mv target/i686-pc-windows-msvc/release/gmsv_workshop.dll target/i686-pc-windows-msvc/release/gmsv_workshop_win32.dll
