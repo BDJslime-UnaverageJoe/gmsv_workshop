@@ -113,7 +113,7 @@ jobs:
     - name: Release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: "vn"
+        tag_name: "build ${{ github.run_number }}"
         files: |
           target/i686-pc-windows-msvc/release/gmsv_workshop_win32.dll
           target/x86_64-pc-windows-msvc/release/gmsv_workshop_win64.dll
