@@ -1,30 +1,35 @@
-use crate::networking_sockets_callback;
-use crate::networking_types::{
-    ListenSocketEvent, MessageNumber, NetConnectionEnd, NetworkingAvailability,
-    NetworkingAvailabilityError, NetworkingConfigEntry, NetworkingIdentity, NetworkingMessage,
-    SendFlags, SteamIpAddr,
+use crate::{networking_sockets_callback, networking_types::NetConnectionRealTimeLaneStatus};
+use crate::{
+    networking_types::{
+        ListenSocketEvent, MessageNumber, NetConnectionEnd, NetConnectionInfo,
+        NetConnectionRealTimeInfo, NetworkingAvailability, NetworkingAvailabilityError,
+        NetworkingConfigEntry, NetworkingIdentity, NetworkingMessage, SendFlags, SteamIpAddr,
+    },
+    SteamError,
 };
 use crate::{CallbackHandle, Inner, SResult};
 #[cfg(test)]
-use serial_test_derive::serial;
+use serial_test::serial;
 use std::convert::TryInto;
 use std::ffi::CString;
 use std::net::SocketAddr;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use sys::SteamNetworkingMessage_t;
 
+use crate::networking_types::{AppNetConnectionEnd, NetConnectionEvent};
 use steamworks_sys as sys;
 
 /// Access to the steam networking sockets interface
-pub struct NetworkingSockets<Manager> {
+pub struct NetworkingSockets {
     pub(crate) sockets: *mut sys::ISteamNetworkingSockets,
-    pub(crate) inner: Arc<Inner<Manager>>,
+    pub(crate) inner: Arc<Inner>,
 }
 
-unsafe impl<T> Send for NetworkingSockets<T> {}
-unsafe impl<T> Sync for NetworkingSockets<T> {}
+unsafe impl Send for NetworkingSockets {}
+unsafe impl Sync for NetworkingSockets {}
 
-impl<Manager: 'static> NetworkingSockets<Manager> {
+impl NetworkingSockets {
     /// Creates a "server" socket that listens for clients to connect to by calling ConnectByIPAddress, over ordinary UDP (IPv4 or IPv6)
     ///
     /// You must select a specific local port to listen on and set it as the port field of the local address.
@@ -43,7 +48,7 @@ impl<Manager: 'static> NetworkingSockets<Manager> {
         &self,
         local_address: SocketAddr,
         options: impl IntoIterator<Item = NetworkingConfigEntry>,
-    ) -> Result<ListenSocket<Manager>, InvalidHandle> {
+    ) -> Result<ListenSocket, InvalidHandle> {
         let local_address = SteamIpAddr::from(local_address);
         let options: Vec<_> = options.into_iter().map(|x| x.into()).collect();
         let handle = unsafe {
@@ -86,7 +91,7 @@ impl<Manager: 'static> NetworkingSockets<Manager> {
         &self,
         address: SocketAddr,
         options: impl IntoIterator<Item = NetworkingConfigEntry>,
-    ) -> Result<NetConnection<Manager>, InvalidHandle> {
+    ) -> Result<NetConnection, InvalidHandle> {
         let handle = unsafe {
             let address = SteamIpAddr::from(address);
             let options: Vec<_> = options.into_iter().map(|x| x.into()).collect();
@@ -135,7 +140,7 @@ impl<Manager: 'static> NetworkingSockets<Manager> {
         &self,
         local_virtual_port: i32,
         options: impl IntoIterator<Item = NetworkingConfigEntry>,
-    ) -> Result<ListenSocket<Manager>, InvalidHandle> {
+    ) -> Result<ListenSocket, InvalidHandle> {
         let options: Vec<_> = options.into_iter().map(|x| x.into()).collect();
         let handle = unsafe {
             sys::SteamAPI_ISteamNetworkingSockets_CreateListenSocketP2P(
@@ -168,7 +173,7 @@ impl<Manager: 'static> NetworkingSockets<Manager> {
         identity_remote: NetworkingIdentity,
         remote_virtual_port: i32,
         options: impl IntoIterator<Item = NetworkingConfigEntry>,
-    ) -> Result<NetConnection<Manager>, InvalidHandle> {
+    ) -> Result<NetConnection, InvalidHandle> {
         let handle = unsafe {
             let options: Vec<_> = options.into_iter().map(|x| x.into()).collect();
             sys::SteamAPI_ISteamNetworkingSockets_ConnectP2P(
@@ -207,7 +212,7 @@ impl<Manager: 'static> NetworkingSockets<Manager> {
         &self,
         local_virtual_port: u32,
         options: impl IntoIterator<Item = NetworkingConfigEntry>,
-    ) -> Result<ListenSocket<Manager>, InvalidHandle> {
+    ) -> Result<ListenSocket, InvalidHandle> {
         let options: Vec<_> = options.into_iter().map(|x| x.into()).collect();
         let handle = unsafe {
             sys::SteamAPI_ISteamNetworkingSockets_CreateHostedDedicatedServerListenSocket(
@@ -256,13 +261,160 @@ impl<Manager: 'static> NetworkingSockets<Manager> {
     /// Create a new poll group.
     ///
     /// You should destroy the poll group when you are done using DestroyPollGroup
-    pub fn create_poll_group(&self) -> NetPollGroup<Manager> {
+    pub fn create_poll_group(&self) -> NetPollGroup {
         let poll_group =
             unsafe { sys::SteamAPI_ISteamNetworkingSockets_CreatePollGroup(self.sockets) };
         NetPollGroup {
             handle: poll_group,
             sockets: self.sockets,
             inner: self.inner.clone(),
+            message_buffer: Vec::new(),
+        }
+    }
+
+    pub fn get_authentication_status(
+        &self,
+    ) -> Result<NetworkingAvailability, NetworkingAvailabilityError> {
+        let mut details: sys::SteamNetAuthenticationStatus_t = unsafe { std::mem::zeroed() };
+        let auth = unsafe {
+            sys::SteamAPI_ISteamNetworkingSockets_GetAuthenticationStatus(
+                self.sockets,
+                &mut details,
+            )
+        };
+
+        auth.try_into()
+    }
+
+    /// Returns basic information about the high-level state of the connection.
+    ///
+    /// Returns false if the connection handle is invalid.
+    pub fn get_connection_info(
+        &self,
+        connection: &NetConnection,
+    ) -> Result<NetConnectionInfo, bool> {
+        let mut info: sys::SteamNetConnectionInfo_t = unsafe { std::mem::zeroed() };
+        let was_successful = unsafe {
+            sys::SteamAPI_ISteamNetworkingSockets_GetConnectionInfo(
+                self.sockets,
+                connection.handle,
+                &mut info,
+            )
+        };
+        if was_successful {
+            Ok(NetConnectionInfo { inner: info })
+        } else {
+            Err(false)
+        }
+    }
+
+    /// Returns a small set of information about the real-time state of the connection and the queue status of each lane.
+    ///
+    /// On entry, lanes specifies the length of the lanes array. This may be 0 if you do not wish to receive any lane data. It's OK for this to be smaller than the total number of configured lanes.
+    ///
+    /// pLanes points to an array that will receive lane-specific info. It can be NULL if this is not needed.
+    pub fn get_realtime_connection_status(
+        &self,
+        connection: &NetConnection,
+        lanes: i32,
+    ) -> Result<
+        (
+            NetConnectionRealTimeInfo,
+            Vec<NetConnectionRealTimeLaneStatus>,
+        ),
+        SteamError,
+    > {
+        let mut info: sys::SteamNetConnectionRealTimeStatus_t = unsafe { std::mem::zeroed() };
+        let mut p_lanes: Vec<sys::SteamNetConnectionRealTimeLaneStatus_t> =
+            Vec::with_capacity(lanes as usize);
+        let result = unsafe {
+            // Get a reference to the uninitialized part of our Vec's buffer
+            let uninitialized = p_lanes.spare_capacity_mut();
+            let status = sys::SteamAPI_ISteamNetworkingSockets_GetConnectionRealTimeStatus(
+                self.sockets,
+                connection.handle,
+                &mut info,
+                lanes,
+                uninitialized.as_mut_ptr().cast(),
+            );
+            // Tell the Vec that we've manually initialized some elements
+            p_lanes.set_len(lanes as usize);
+            status
+        };
+        crate::to_steam_result(result).map(|_| {
+            (
+                NetConnectionRealTimeInfo { inner: info },
+                p_lanes
+                    .into_iter()
+                    .map(|x| NetConnectionRealTimeLaneStatus { inner: x })
+                    .collect(),
+            )
+        })
+    }
+    /// Configure multiple outbound messages streams ("lanes") on a connection, and control head-of-line blocking between them. Messages within a given lane are always sent in the order they are queued, but messages from different lanes may be sent out of order. Each lane has its own message number sequence. The first message sent on each lane will be assigned the number 1.
+    ///
+    /// Each lane has a "priority". Lower priority lanes will only be processed when all higher-priority lanes are empty. The magnitudes of the priority values are not relevant, only their sort order. Higher numeric values take priority over lower numeric values.
+    ///
+    /// Each lane also is assigned a weight, which controls the approximate proportion of the bandwidth that will be consumed by the lane, relative to other lanes of the same priority. (This is assuming the lane stays busy. An idle lane does not build up "credits" to be be spent once a message is queued.) This value is only meaningful as a proportion, relative to other lanes with the same priority. For lanes with different priorities, the strict priority order will prevail, and their weights relative to each other are not relevant. Thus, if a lane has a unique priority value, the weight value for that lane is not relevant.
+    ///
+    /// Example: 3 lanes, with priorities { 0, 10, 10 } and weights { (NA), 20, 5 }. Messages sent on the first will always be sent first, before messages in the other two lanes. Its weight value is irrelevant, since there are no other lanes with priority=0. The other two lanes will share bandwidth, with the second and third lanes sharing bandwidth using a ratio of approximately 4:1. (The weights { NA, 4, 1 } would be equivalent.)
+    pub fn configure_connection_lanes(
+        &self,
+        connection: &NetConnection,
+        num_lanes: i32,
+        lane_priorities: &[i32],
+        lane_weights: &[u16],
+    ) -> Result<(), SteamError> {
+        let result = unsafe {
+            sys::SteamAPI_ISteamNetworkingSockets_ConfigureConnectionLanes(
+                self.sockets,
+                connection.handle,
+                num_lanes,
+                lane_priorities.as_ptr(),
+                lane_weights.as_ptr(),
+            )
+        };
+        crate::to_steam_result(result)
+    }
+
+    /// Send one or more messages on any connection, with per-message lane/channel support.
+    ///
+    /// Each `NetworkingMessage` must have its connection set via `set_connection()`.
+    /// Use `set_channel()` to specify the lane for each message.
+    ///
+    /// This is the same as `ListenSocket::send_messages()` but callable without
+    /// a listen socket — works for both listener and dialer sides.
+    ///
+    /// pOutMessageNumberOrResult is an optional array that will receive,
+    /// for each message, the message number that was assigned to the message
+    /// if sending was successful.  If sending failed, then a negative EResult
+    /// value is placed into the array.  For example, the array will hold
+    /// -k_EResultInvalidState if the connection was in an invalid state.
+    /// See ISteamNetworkingSockets::SendMessageToConnection for possible
+    /// failure codes.
+    pub fn send_messages(
+        &self,
+        messages: impl IntoIterator<Item = NetworkingMessage>,
+    ) -> Vec<SResult<MessageNumber>> {
+        let messages: Vec<_> = messages.into_iter().map(|x| x.take_message()).collect();
+        let mut results = vec![0; messages.len()];
+        unsafe {
+            sys::SteamAPI_ISteamNetworkingSockets_SendMessages(
+                self.sockets,
+                messages.len() as _,
+                messages.as_ptr(),
+                results.as_mut_ptr(),
+            );
+            results
+                .into_iter()
+                .map(|x| {
+                    if x >= 0 {
+                        Ok(MessageNumber(x as u64))
+                    } else {
+                        Err((-x).try_into().expect("invalid error code"))
+                    }
+                })
+                .collect()
         }
     }
 }
@@ -275,20 +427,17 @@ impl<Manager: 'static> NetworkingSockets<Manager> {
 /// If a Listen Socket goes out of scope while there are still connections, but new requests will be rejected immediately.
 ///
 /// Listen Socket Events will only be available if steam callback are regularly called.
-pub struct ListenSocket<Manager> {
-    inner: Arc<InnerSocket<Manager>>,
-    _callback_handle: Arc<CallbackHandle<Manager>>,
-    receiver: Receiver<ListenSocketEvent<Manager>>,
+pub struct ListenSocket {
+    inner: Arc<InnerSocket>,
+    _callback_handle: Arc<CallbackHandle>,
+    receiver: Receiver<ListenSocketEvent>,
 }
 
-unsafe impl<Manager: Send + Sync> Send for ListenSocket<Manager> {}
-unsafe impl<Manager: Send + Sync> Sync for ListenSocket<Manager> {}
-
-impl<Manager: 'static> ListenSocket<Manager> {
+impl ListenSocket {
     pub(crate) fn new(
         handle: sys::HSteamListenSocket,
         sockets: *mut sys::ISteamNetworkingSockets,
-        inner: Arc<Inner<Manager>>,
+        inner: Arc<Inner>,
     ) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         let inner_socket = Arc::new(InnerSocket {
@@ -314,14 +463,14 @@ impl<Manager: 'static> ListenSocket<Manager> {
     /// Tries to receive a pending event. This will never block.
     ///
     /// You should answer ConnectionRequests immediately or the server will appear as unresponsive.
-    pub fn try_receive_event(&self) -> Option<ListenSocketEvent<Manager>> {
+    pub fn try_receive_event(&self) -> Option<ListenSocketEvent> {
         self.receiver.try_recv().ok()
     }
 
     /// Receive the next event. This will block until the next event is received.
     ///
     /// You should answer ConnectionRequests immediately or the server will appear as unresponsive.
-    pub fn receive_event(&self) -> ListenSocketEvent<Manager> {
+    pub fn receive_event(&self) -> ListenSocketEvent {
         self.receiver
             .recv()
             .expect("all senders were closed, even though the listen socket is still in use")
@@ -330,7 +479,7 @@ impl<Manager: 'static> ListenSocket<Manager> {
     /// Returns an iterator for ListenSocketEvents that will block until the next event is received
     ///
     /// You should answer ConnectionRequests immediately or the server will appear as unresponsive.
-    pub fn events<'a>(&'a self) -> impl Iterator<Item = ListenSocketEvent<Manager>> + 'a {
+    pub fn events<'a>(&'a self) -> impl Iterator<Item = ListenSocketEvent> + 'a {
         self.receiver.iter()
     }
 
@@ -362,10 +511,10 @@ impl<Manager: 'static> ListenSocket<Manager> {
     /// Returns the message number or Steam error for each sent message.
     pub fn send_messages(
         &self,
-        messages: impl IntoIterator<Item = NetworkingMessage<Manager>>,
+        messages: impl IntoIterator<Item = NetworkingMessage>,
     ) -> Vec<SResult<MessageNumber>> {
         let messages: Vec<_> = messages.into_iter().map(|x| x.take_message()).collect();
-        let mut results = vec![0;messages.len()];
+        let mut results = vec![0; messages.len()];
         unsafe {
             sys::SteamAPI_ISteamNetworkingSockets_SendMessages(
                 self.inner.sockets,
@@ -378,7 +527,7 @@ impl<Manager: 'static> ListenSocket<Manager> {
                 .into_iter()
                 .map(|x| {
                     if x >= 0 {
-                        Ok(MessageNumber(x))
+                        Ok(MessageNumber(x as u64))
                     } else {
                         Err((-x).try_into().expect("invalid error code"))
                     }
@@ -389,13 +538,16 @@ impl<Manager: 'static> ListenSocket<Manager> {
 }
 
 /// Inner struct that keeps sockets alive as long as there is still a connection alive
-pub(crate) struct InnerSocket<Manager> {
+pub(crate) struct InnerSocket {
     pub(crate) sockets: *mut sys::ISteamNetworkingSockets,
     pub(crate) handle: sys::HSteamListenSocket,
-    pub(crate) inner: Arc<Inner<Manager>>,
+    pub(crate) inner: Arc<Inner>,
 }
 
-impl<Manager> Drop for InnerSocket<Manager> {
+unsafe impl Send for InnerSocket {}
+unsafe impl Sync for InnerSocket {}
+
+impl Drop for InnerSocket {
     fn drop(&mut self) {
         // There's no documentation for this return value, so it's most likely false when hSocket is invalid
         // The handle should always be valid in our case.
@@ -416,26 +568,26 @@ impl<Manager> Drop for InnerSocket<Manager> {
     }
 }
 
-pub struct NetConnection<Manager> {
+pub struct NetConnection {
     pub(crate) handle: sys::HSteamNetConnection,
     sockets: *mut sys::ISteamNetworkingSockets,
-    inner: Arc<Inner<Manager>>,
-    socket: Option<Arc<InnerSocket<Manager>>>,
-    _callback_handle: Option<Arc<CallbackHandle<Manager>>>,
-    _event_receiver: Option<Receiver<()>>,
-
+    inner: Arc<Inner>,
+    socket: Option<Arc<InnerSocket>>,
+    _callback_handle: Option<Arc<CallbackHandle>>,
+    event_receiver: Option<Receiver<NetConnectionEvent>>,
+    message_buffer: Vec<*mut SteamNetworkingMessage_t>,
     is_handled: bool,
 }
 
-unsafe impl<Manager: Send + Sync> Send for NetConnection<Manager> {}
-unsafe impl<Manager: Send + Sync> Sync for NetConnection<Manager> {}
+unsafe impl Send for NetConnection {}
+unsafe impl Sync for NetConnection {}
 
-impl<Manager: 'static> NetConnection<Manager> {
+impl NetConnection {
     pub(crate) fn new(
         handle: sys::HSteamNetConnection,
         sockets: *mut sys::ISteamNetworkingSockets,
-        inner: Arc<Inner<Manager>>,
-        socket: Arc<InnerSocket<Manager>>,
+        inner: Arc<Inner>,
+        socket: Arc<InnerSocket>,
     ) -> Self {
         NetConnection {
             handle,
@@ -443,7 +595,8 @@ impl<Manager: 'static> NetConnection<Manager> {
             inner,
             socket: Some(socket),
             _callback_handle: None,
-            _event_receiver: None,
+            event_receiver: None,
+            message_buffer: Vec::new(),
             is_handled: false,
         }
     }
@@ -451,7 +604,7 @@ impl<Manager: 'static> NetConnection<Manager> {
     pub(crate) fn new_independent(
         handle: sys::HSteamNetConnection,
         sockets: *mut sys::ISteamNetworkingSockets,
-        inner: Arc<Inner<Manager>>,
+        inner: Arc<Inner>,
     ) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
         inner
@@ -468,7 +621,8 @@ impl<Manager: 'static> NetConnection<Manager> {
             inner,
             socket: None,
             _callback_handle: Some(callback),
-            _event_receiver: Some(receiver),
+            event_receiver: Some(receiver),
+            message_buffer: Vec::new(),
             is_handled: false,
         }
     }
@@ -478,7 +632,7 @@ impl<Manager: 'static> NetConnection<Manager> {
     pub(crate) fn new_internal(
         handle: sys::HSteamNetConnection,
         sockets: *mut sys::ISteamNetworkingSockets,
-        inner: Arc<Inner<Manager>>,
+        inner: Arc<Inner>,
     ) -> Self {
         NetConnection {
             handle,
@@ -486,8 +640,28 @@ impl<Manager: 'static> NetConnection<Manager> {
             inner,
             socket: None,
             _callback_handle: None,
-            _event_receiver: None,
+            event_receiver: None,
+            message_buffer: Vec::new(),
             is_handled: false,
+        }
+    }
+
+    pub fn info(&self) -> Result<NetConnectionInfo, InvalidHandle> {
+        let mut steam_net_conn_info = std::mem::MaybeUninit::uninit();
+
+        let was_successful = unsafe {
+            sys::SteamAPI_ISteamNetworkingSockets_GetConnectionInfo(
+                self.sockets,
+                self.handle,
+                steam_net_conn_info.as_mut_ptr(),
+            )
+        };
+
+        if was_successful {
+            let steam_net_conn_info = unsafe { steam_net_conn_info.assume_init() };
+            Ok(NetConnectionInfo::from(steam_net_conn_info))
+        } else {
+            Err(InvalidHandle)
         }
     }
 
@@ -555,10 +729,7 @@ impl<Manager: 'static> NetConnection<Manager> {
         let result = unsafe {
             sys::SteamAPI_ISteamNetworkingSockets_AcceptConnection(self.sockets, self.handle)
         };
-        match result {
-            sys::EResult::k_EResultOK => Ok(()),
-            error => Err(error.into()),
-        }
+        crate::to_steam_result(result)
     }
 
     /// Disconnects from the remote host and invalidates the connection handle.
@@ -700,10 +871,7 @@ impl<Manager: 'static> NetConnection<Manager> {
                 send_flags.bits(),
                 &mut out_message_number,
             );
-            match result {
-                sys::EResult::k_EResultOK => Ok(MessageNumber(out_message_number)),
-                error => Err(error.into()),
-            }
+            crate::to_steam_result(result).map(|_| MessageNumber(out_message_number as u64))
         }
     }
 
@@ -731,12 +899,29 @@ impl<Manager: 'static> NetConnection<Manager> {
                 self.sockets,
                 self.handle,
             );
-            if let sys::EResult::k_EResultOK = result {
-                Ok(())
-            } else {
-                Err(result.into())
-            }
+            crate::to_steam_result(result)
         }
+    }
+
+    /// Internal function used by `receive_messages` and `receive_messages_noalloc`.
+    fn receive_messages_internal(&mut self, batch_size: usize) -> Result<usize, InvalidHandle> {
+        debug_assert!(self.message_buffer.capacity() >= batch_size);
+        self.message_buffer.clear();
+        let message_count = unsafe {
+            sys::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection(
+                self.sockets,
+                self.handle,
+                self.message_buffer.as_mut_ptr(),
+                batch_size as _,
+            )
+        };
+        if message_count < 0 {
+            return Err(InvalidHandle);
+        }
+        unsafe {
+            self.message_buffer.set_len(message_count as usize);
+        }
+        Ok(message_count as usize)
     }
 
     /// Fetch the next available message(s) from the connection, if any.
@@ -750,30 +935,83 @@ impl<Manager: 'static> NetConnection<Manager> {
     /// Unreliable messages may be dropped, or delivered out of order with respect to
     /// each other or with respect to reliable messages.  The same unreliable message
     /// may be received multiple times.
-    ///
-    /// If any messages are returned, you MUST call SteamNetworkingMessage_t::Release() on each
-    /// of them free up resources after you are done.  It is safe to keep the object alive for
-    /// a little while (put it into some queue, etc), and you may call Release() from any thread.
-    pub fn receive_messages(&self, batch_size: usize) -> Vec<NetworkingMessage<Manager>> {
-        // TODO: Optionally make it possible to reuse the same buffer to avoid allocation
-        let mut buffer = Vec::with_capacity(batch_size);
-        unsafe {
-            let message_count = sys::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnConnection(
-                self.sockets,
-                self.handle,
-                buffer.as_mut_ptr(),
-                batch_size as _,
-            );
-            buffer.set_len(message_count as usize);
+    pub fn receive_messages(
+        &mut self,
+        batch_size: usize,
+    ) -> Result<Vec<NetworkingMessage>, InvalidHandle> {
+        if self.message_buffer.capacity() < batch_size {
+            // reserve(additional) ensures capacity >= len + additional.
+            // Since the buffer is always drained between calls, len == 0,
+            // so reserve(batch_size) guarantees capacity >= batch_size.
+            self.message_buffer.reserve(batch_size);
         }
 
-        buffer
-            .into_iter()
+        self.receive_messages_internal(batch_size)?;
+
+        Ok(self
+            .message_buffer
+            .drain(..)
             .map(|x| NetworkingMessage {
                 message: x,
                 _inner: self.inner.clone(),
             })
-            .collect()
+            .collect())
+    }
+
+    /// Like `receive_messages`, but puts the results inside `dest`
+    pub fn receive_messages_into(
+        &mut self,
+        dest: &mut Vec<NetworkingMessage>,
+        batch_size: usize,
+    ) -> Result<(), InvalidHandle> {
+        if self.message_buffer.capacity() < batch_size {
+            // reserve(additional) ensures capacity >= len + additional.
+            // Since the buffer is always drained between calls, len == 0,
+            // so reserve(batch_size) guarantees capacity >= batch_size.
+            self.message_buffer.reserve(batch_size);
+        }
+
+        self.receive_messages_internal(batch_size)?;
+
+        dest.reserve_exact(batch_size);
+        for message in self.message_buffer.drain(..) {
+            dest.push(NetworkingMessage {
+                message,
+                _inner: self.inner.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Receives messages like `receive_messages`, but does not allocate a Vec to get the results.
+    ///
+    /// Instead, whenever a message is received, the closure is called with a `NetworkingMessage` for every message.
+    ///
+    /// All messages available in the queue will always be received in one call and you don't have to worry about batch size.
+    pub fn receive_messages_with(&mut self, mut f: impl FnMut(NetworkingMessage)) {
+        const MIN_CAPACITY: usize = 32;
+        let mut cap = self.message_buffer.capacity();
+        if cap < MIN_CAPACITY {
+            self.message_buffer.reserve_exact(MIN_CAPACITY - cap);
+            cap = self.message_buffer.capacity();
+        }
+
+        loop {
+            let Ok(message_count) = self.receive_messages_internal(cap) else {
+                return;
+            };
+
+            for msg in self.message_buffer.drain(..) {
+                f(NetworkingMessage {
+                    message: msg,
+                    _inner: self.inner.clone(),
+                })
+            }
+            if message_count < cap {
+                break;
+            }
+        }
     }
 
     /// Assign a connection to a poll group.  Note that a connection may only belong to a
@@ -790,7 +1028,7 @@ impl<Manager: 'static> NetConnection<Manager> {
     ///
     /// Returns false if the connection handle is invalid, or if the poll group handle
     /// is invalid (and not k_HSteamNetPollGroup_Invalid).
-    pub fn set_poll_group(&self, poll_group: &NetPollGroup<Manager>) {
+    pub fn set_poll_group(&self, poll_group: &NetPollGroup) {
         let was_successful = unsafe {
             sys::SteamAPI_ISteamNetworkingSockets_SetConnectionPollGroup(
                 self.sockets,
@@ -801,13 +1039,38 @@ impl<Manager: 'static> NetConnection<Manager> {
         debug_assert!(was_successful);
     }
 
+    /// Tries to receive a pending event. This will never block.
+    ///
+    /// Some `NetConnection` do not receive events through this method but instead through the ListenSocket,
+    /// in that case this will always return `None`
+    pub fn try_receive_event(&self) -> Option<NetConnectionEvent> {
+        self.event_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+    }
+
+    /// Returns an iterator for ListenSocketEvents that will block until the next event is received
+    ///
+    /// Some `NetConnection` do not receive events through this method but instead through the ListenSocket,
+    /// in that case this will always return `None`. Otherwise, this will return an iterator that empties
+    /// the queue of events.
+    pub fn try_events<'a>(&'a self) -> Option<impl Iterator<Item = NetConnectionEvent> + 'a> {
+        self.event_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_iter())
+    }
+
+    pub fn run_callbacks(&self) {
+        unsafe { sys::SteamAPI_ISteamNetworkingSockets_RunCallbacks(self.sockets) }
+    }
+
     /// Set the connection state to be handled externally. The struct will no longer close the connection on drop.
     pub(crate) fn handle_connection(&mut self) {
         self.is_handled = true
     }
 }
 
-impl<Manager> Drop for NetConnection<Manager> {
+impl Drop for NetConnection {
     fn drop(&mut self) {
         if !self.is_handled {
             let debug_string = CString::new("Handle was dropped").unwrap();
@@ -815,7 +1078,7 @@ impl<Manager> Drop for NetConnection<Manager> {
                 sys::SteamAPI_ISteamNetworkingSockets_CloseConnection(
                     self.sockets,
                     self.handle,
-                    NetConnectionEnd::AppGeneric.into(),
+                    NetConnectionEnd::App(AppNetConnectionEnd::generic_normal()).into(),
                     debug_string.as_ptr(),
                     false,
                 )
@@ -834,29 +1097,37 @@ impl<Manager> Drop for NetConnection<Manager> {
     }
 }
 
-pub struct NetPollGroup<Manager> {
+pub struct NetPollGroup {
     handle: sys::HSteamNetPollGroup,
     sockets: *mut sys::ISteamNetworkingSockets,
-    inner: Arc<Inner<Manager>>,
+    inner: Arc<Inner>,
+    message_buffer: Vec<*mut SteamNetworkingMessage_t>,
 }
 
-unsafe impl<Manager: Send + Sync> Send for NetPollGroup<Manager> {}
-unsafe impl<Manager: Send + Sync> Sync for NetPollGroup<Manager> {}
+unsafe impl Send for NetPollGroup {}
+unsafe impl Sync for NetPollGroup {}
 
-impl<Manager> NetPollGroup<Manager> {
-    pub fn receive_messages(&self, batch_size: usize) -> Vec<NetworkingMessage<Manager>> {
-        let mut buffer = Vec::with_capacity(batch_size);
+impl NetPollGroup {
+    pub fn receive_messages(&mut self, batch_size: usize) -> Vec<NetworkingMessage> {
+        if self.message_buffer.capacity() < batch_size {
+            // reserve(additional) ensures capacity >= len + additional.
+            // Since the buffer is always drained between calls, len == 0,
+            // so reserve(batch_size) guarantees capacity >= batch_size.
+            self.message_buffer.reserve(batch_size);
+        }
+
         unsafe {
             let count = sys::SteamAPI_ISteamNetworkingSockets_ReceiveMessagesOnPollGroup(
                 self.sockets,
                 self.handle,
-                buffer.as_mut_ptr(),
+                self.message_buffer.as_mut_ptr(),
                 batch_size as _,
             ) as usize;
-            buffer.set_len(count);
+            self.message_buffer.set_len(count);
         }
-        buffer
-            .into_iter()
+
+        self.message_buffer
+            .drain(..)
             .map(|x| NetworkingMessage {
                 message: x,
                 _inner: self.inner.clone(),
@@ -865,7 +1136,7 @@ impl<Manager> NetPollGroup<Manager> {
     }
 }
 
-impl<Manager> Drop for NetPollGroup<Manager> {
+impl Drop for NetPollGroup {
     fn drop(&mut self) {
         let _was_successful = unsafe {
             sys::SteamAPI_ISteamNetworkingSockets_DestroyPollGroup(self.sockets, self.handle)
@@ -881,7 +1152,7 @@ pub struct InvalidHandle;
 mod tests {
     use std::net::Ipv4Addr;
 
-    use crate::Client;
+    use crate::{networking_types::NetworkingConnectionState, Client};
 
     use super::*;
     use crate::networking_types::{
@@ -891,7 +1162,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_create_listen_socket_ip() {
-        let (client, _single) = Client::init().unwrap();
+        let client = Client::init().unwrap();
         let sockets = client.networking_sockets();
         let socket_result = sockets.create_listen_socket_ip(
             SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), 12345),
@@ -901,8 +1172,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_socket_connection() {
-        let (client, single) = Client::init().unwrap();
+        let client = Client::init().unwrap();
         let sockets = client.networking_sockets();
 
         sockets.init_authentication().unwrap();
@@ -919,13 +1191,13 @@ mod tests {
             .unwrap();
 
         println!("Create connection");
-        let to_server = sockets
+        let mut to_server = sockets
             .connect_by_ip_address(bound_ip, debug_config)
             .unwrap();
 
         println!("Run callbacks");
         for _ in 0..5 {
-            single.run_callbacks();
+            client.run_callbacks();
             std::thread::sleep(::std::time::Duration::from_millis(50));
         }
 
@@ -940,15 +1212,63 @@ mod tests {
 
         println!("Run callbacks");
         for _ in 0..5 {
-            single.run_callbacks();
+            client.run_callbacks();
             std::thread::sleep(::std::time::Duration::from_millis(50));
         }
 
         let event = socket.try_receive_event().unwrap();
-        let to_client = match event {
+        let mut to_client = match event {
             ListenSocketEvent::Connected(connected) => connected.take_connection(),
             _ => panic!("unexpected event"),
         };
+
+        println!("Configure connection lanes");
+        let mut lane_priorities = vec![0; 2];
+        let mut lane_weights = vec![0; 2];
+        lane_priorities[0] = 1;
+        lane_weights[0] = 1;
+        lane_priorities[1] = 1;
+        lane_weights[1] = 3;
+
+        let result =
+            sockets.configure_connection_lanes(&to_server, 2, &lane_priorities, &lane_weights);
+        assert!(result.is_ok());
+
+        println!("Get connection info remote client");
+        let info = sockets.get_connection_info(&to_client).unwrap();
+        match info.state() {
+            Ok(state) => assert_eq!(state, NetworkingConnectionState::Connected),
+            _ => panic!("unexpected state"),
+        }
+
+        println!("Get connection info server");
+        let info = sockets.get_connection_info(&to_server).unwrap();
+        match info.state() {
+            Ok(state) => assert_eq!(state, NetworkingConnectionState::Connected),
+            _ => panic!("unexpected state"),
+        }
+
+        println!("Get quick connection info remote client");
+        let (info, lanes) = sockets
+            .get_realtime_connection_status(&to_client, 0)
+            .unwrap();
+        if let Ok(net_connection) = info.connection_state() {
+            assert_eq!(net_connection, NetworkingConnectionState::Connected);
+            assert_eq!(lanes.len(), 0);
+        } else {
+            panic!("unexpected state");
+        }
+
+        println!("Get quick connection info server");
+        let (info, lanes) = sockets
+            .get_realtime_connection_status(&to_server, 2)
+            .unwrap();
+        if let Ok(net_connection) = info.connection_state() {
+            assert_eq!(net_connection, NetworkingConnectionState::Connected);
+            assert_eq!(lanes.len(), 2);
+        } else {
+            panic!("unexpected state");
+        }
 
         println!("Send message to server");
         to_server
@@ -958,7 +1278,7 @@ mod tests {
         std::thread::sleep(::std::time::Duration::from_millis(100));
 
         println!("Receive message");
-        let messages = to_client.receive_messages(10);
+        let messages = to_client.receive_messages(10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].data(), &[1, 1, 2, 5]);
 
@@ -970,7 +1290,7 @@ mod tests {
         std::thread::sleep(::std::time::Duration::from_millis(100));
 
         println!("Receive message");
-        let messages = to_server.receive_messages(10);
+        let messages = to_server.receive_messages(10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].data(), &[3, 3, 3, 1]);
 
@@ -985,7 +1305,7 @@ mod tests {
         std::thread::sleep(::std::time::Duration::from_millis(1000));
 
         println!("Receive message");
-        let messages = to_server.receive_messages(10);
+        let messages = to_server.receive_messages(10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].data(), &[1, 2, 34, 5]);
     }

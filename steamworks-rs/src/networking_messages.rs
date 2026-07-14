@@ -24,7 +24,8 @@
 //! (See k_ESteamNetworkingConfig_SymmetricConnect.)
 // TODO: examples here
 use crate::networking_types::{
-    NetConnectionInfo, NetworkingIdentity, NetworkingMessage, SendFlags,
+    NetConnectionInfo, NetConnectionRealTimeInfo, NetworkingConnectionState, NetworkingIdentity,
+    NetworkingMessage, SendFlags,
 };
 use crate::{register_callback, Callback, Inner, SteamError};
 use std::ffi::c_void;
@@ -33,15 +34,15 @@ use std::sync::{Arc, Weak};
 use steamworks_sys as sys;
 
 /// Access to the steam networking messages interface
-pub struct NetworkingMessages<Manager> {
+pub struct NetworkingMessages {
     pub(crate) net: *mut sys::ISteamNetworkingMessages,
-    pub(crate) inner: Arc<Inner<Manager>>,
+    pub(crate) inner: Arc<Inner>,
 }
 
-unsafe impl<Manager> Sync for NetworkingMessages<Manager> {}
-unsafe impl<Manager> Send for NetworkingMessages<Manager> {}
+unsafe impl Sync for NetworkingMessages {}
+unsafe impl Send for NetworkingMessages {}
 
-impl<Manager: 'static> NetworkingMessages<Manager> {
+impl NetworkingMessages {
     /// Sends a message to the specified host.
     ///
     /// If we don't already have a session with that user, a session is implicitly created.
@@ -95,7 +96,7 @@ impl<Manager: 'static> NetworkingMessages<Manager> {
             sys::SteamAPI_ISteamNetworkingMessages_SendMessageToUser(
                 self.net,
                 user.as_ptr(),
-                data.as_ptr() as *const c_void,
+                data.as_ptr().cast(),
                 data.len() as u32,
                 send_type.bits(),
                 channel as i32,
@@ -117,25 +118,24 @@ impl<Manager: 'static> NetworkingMessages<Manager> {
     /// ```
     /// # use steamworks::Client;
     /// # use std::time::Duration;
-    /// let (client, single) = Client::init().unwrap();
-    ///
-    /// // run_callbacks must be called regularly, or no incoming connections can be received
-    /// let callback_loop = std::thread::spawn(move || loop {
-    ///     single.run_callbacks();
-    ///     std::thread::sleep(Duration::from_millis(10));
-    /// });
+    /// let client = Client::init().unwrap();
     /// let networking_messages = client.networking_messages();
     ///
     /// // Accept all new connections
-    /// networking_messages.session_request_callback(|request| request.accept());
+    /// networking_messages.session_request_callback(|request| { request.accept(); });
     ///
-    /// let _received = networking_messages.receive_messages_on_channel(0, 10);
+    /// // Run the callbacks and receive messages
+    /// for _ in 0..50 {
+    ///     client.run_callbacks();
+    ///     let _received = networking_messages.receive_messages_on_channel(0, 10);
+    ///     std::thread::sleep(Duration::from_millis(10));
+    /// }
     /// ```
     pub fn receive_messages_on_channel(
         &self,
         channel: u32,
         batch_size: usize,
-    ) -> Vec<NetworkingMessage<Manager>> {
+    ) -> Vec<NetworkingMessage> {
         let mut buffer = Vec::with_capacity(batch_size);
         unsafe {
             let message_count = sys::SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel(
@@ -160,36 +160,35 @@ impl<Manager: 'static> NetworkingMessages<Manager> {
     ///
     /// Use the [`SessionRequest`](../networking_messages/struct.SessionRequest.html) to accept or reject the connection.
     ///
-    /// Requires regularly calling [`SingleClient.run_callbacks()`](../struct.SingleClient.html#method.run_callbacks).
+    /// Requires regularly calling [`Client.run_callbacks()`](../struct.Client.html#method.run_callbacks).
     /// Calling this function more than once will replace the previous callback.
     ///
     /// # Example
     /// ```
     /// # use steamworks::Client;
     /// # use std::time::Duration;
-    /// let (client, single) = Client::init().unwrap();
-    ///
-    /// // run_callbacks must be called regularly, or no incoming connections can be received
-    /// let callback_loop = std::thread::spawn(move || loop {
-    ///     single.run_callbacks();
-    ///     std::thread::sleep(Duration::from_millis(10));
-    /// });
+    /// let client = Client::init().unwrap();
     /// let messages = client.networking_messages();
     ///
     /// // Accept all incoming connections
     /// messages.session_request_callback(|request| {
     ///     request.accept();
     /// });
+    ///
+    /// // run_callbacks must be called regularly, or no incoming connections can be received
+    /// for _ in 0..50 {
+    ///     client.run_callbacks();
+    /// }
     /// ```
     pub fn session_request_callback(
         &self,
-        mut callback: impl FnMut(SessionRequest<Manager>) + Send + 'static,
+        mut callback: impl FnMut(SessionRequest) + Send + 'static,
     ) {
         let builder = SessionRequestBuilder {
             message: self.net,
             inner: Arc::downgrade(&self.inner),
         };
-        unsafe {
+        let call_handle = unsafe {
             register_callback(
                 &self.inner,
                 move |request: NetworkingMessagesSessionRequest| {
@@ -197,104 +196,155 @@ impl<Manager: 'static> NetworkingMessages<Manager> {
                         callback(request);
                     }
                 },
-            );
-        }
+            )
+        };
+        std::mem::forget(call_handle);
     }
 
     /// Register a callback that will be called whenever a connection fails to be established.
     ///
-    /// Requires regularly calling [`SingleClient.run_callbacks()`](../struct.SingleClient.html#method.run_callbacks).
+    /// Requires regularly calling [`Client.run_callbacks()`](../struct.Client.html#method.run_callbacks).
     /// Calling this function more than once will replace the previous callback.
     pub fn session_failed_callback(
         &self,
         mut callback: impl FnMut(NetConnectionInfo) + Send + 'static,
     ) {
-        unsafe {
+        let call_handle = unsafe {
             register_callback(
                 &self.inner,
                 move |failed: NetworkingMessagesSessionFailed| {
                     callback(failed.info);
                 },
-            );
-        }
+            )
+        };
+        std::mem::forget(call_handle);
+    }
+
+    /// Get information about the status of a connection to a remote host.
+    ///
+    /// This provides information about the connection, such as whether it's currently
+    /// connected, attempting to connect, etc., as well as some statistics about the
+    /// connection quality if available.
+    ///
+    /// Returns the current connection state, along with detailed connection info and
+    /// real-time status (if avaliable).
+    pub fn get_session_connection_info(
+        &self,
+        identity_remote: &NetworkingIdentity,
+    ) -> (
+        NetworkingConnectionState,
+        Option<NetConnectionInfo>,
+        Option<NetConnectionRealTimeInfo>,
+    ) {
+        let mut connection_info: sys::SteamNetConnectionInfo_t = unsafe { std::mem::zeroed() };
+        let mut quick_status: sys::SteamNetConnectionRealTimeStatus_t =
+            unsafe { std::mem::zeroed() };
+
+        let state = unsafe {
+            sys::SteamAPI_ISteamNetworkingMessages_GetSessionConnectionInfo(
+                self.net,
+                identity_remote.as_ptr(),
+                &mut connection_info,
+                &mut quick_status,
+            )
+        };
+
+        let state = match NetworkingConnectionState::try_from(state) {
+            Ok(state) => state,
+            Err(_) => NetworkingConnectionState::None,
+        };
+
+        let connection_info = if state != NetworkingConnectionState::None {
+            Some(NetConnectionInfo {
+                inner: connection_info,
+            })
+        } else {
+            None
+        };
+
+        let quick_status = if state != NetworkingConnectionState::None {
+            Some(NetConnectionRealTimeInfo {
+                inner: quick_status,
+            })
+        } else {
+            None
+        };
+
+        (state, connection_info, quick_status)
     }
 }
 
 /// A helper for creating SessionRequests.
 ///
 /// It's Send and Sync, so it can be moved into the callback.
-struct SessionRequestBuilder<Manager> {
+struct SessionRequestBuilder {
     message: *mut sys::ISteamNetworkingMessages,
     // Once the builder is in the callback, it creates a cyclic reference, so this has to be Weak
-    inner: Weak<Inner<Manager>>,
+    inner: Weak<Inner>,
 }
 
-unsafe impl<Manager> Sync for SessionRequestBuilder<Manager> {}
-unsafe impl<Manager> Send for SessionRequestBuilder<Manager> {}
+unsafe impl Send for SessionRequestBuilder {}
+unsafe impl Sync for SessionRequestBuilder {}
 
-impl<Manager> SessionRequestBuilder<Manager> {
-    pub fn build_request(&self, remote: NetworkingIdentity) -> Option<SessionRequest<Manager>> {
+impl SessionRequestBuilder {
+    pub fn build_request(&self, remote: NetworkingIdentity) -> Option<SessionRequest> {
         self.inner.upgrade().map(|inner| SessionRequest {
             remote,
             messages: self.message,
+            accepted: false,
             _inner: inner,
         })
     }
 }
 
-struct NetworkingMessagesSessionRequest {
+#[derive(Debug)]
+pub struct NetworkingMessagesSessionRequest {
     remote: NetworkingIdentity,
 }
 
-unsafe impl Callback for NetworkingMessagesSessionRequest {
-    const ID: i32 = sys::SteamNetworkingMessagesSessionRequest_t_k_iCallback as _;
-    const SIZE: i32 = std::mem::size_of::<sys::SteamNetworkingMessagesSessionRequest_t>() as _;
+impl_callback!(cb: SteamNetworkingMessagesSessionRequest_t => NetworkingMessagesSessionRequest {
+    let remote = cb.m_identityRemote.into();
+    Self { remote }
+});
 
-    unsafe fn from_raw(raw: *mut c_void) -> Self {
-        let remote = *(raw as *mut sys::SteamNetworkingMessagesSessionRequest_t);
-        let remote = remote.m_identityRemote.into();
-        Self { remote }
-    }
-}
-
-struct NetworkingMessagesSessionFailed {
+#[derive(Debug)]
+pub struct NetworkingMessagesSessionFailed {
     pub info: NetConnectionInfo,
 }
 
-unsafe impl Callback for NetworkingMessagesSessionFailed {
-    const ID: i32 = sys::SteamNetworkingMessagesSessionFailed_t_k_iCallback as _;
-    const SIZE: i32 = std::mem::size_of::<sys::SteamNetworkingMessagesSessionFailed_t>() as _;
-
-    unsafe fn from_raw(raw: *mut c_void) -> Self {
-        let remote = *(raw as *mut sys::SteamNetworkingMessagesSessionFailed_t);
-        let remote = remote.m_info.into();
-        Self { info: remote }
-    }
-}
+impl_callback!(cb: SteamNetworkingMessagesSessionFailed_t => NetworkingMessagesSessionFailed {
+    let remote = cb.m_info.into();
+    Self { info: remote }
+});
 
 /// A request for a new connection.
 ///
 /// Use this to accept or reject the connection.
 /// Letting this struct go out of scope will reject the connection.
-pub struct SessionRequest<Manager> {
+pub struct SessionRequest {
     remote: NetworkingIdentity,
     messages: *mut sys::ISteamNetworkingMessages,
-    _inner: Arc<Inner<Manager>>,
+    /// Keep track if connection should be rejected on drop
+    // This is used instead of `std::mem::forget` to properly clean up other
+    // resources. Is it even wise to automatically reject the connection?
+    accepted: bool,
+    _inner: Arc<Inner>,
 }
 
-unsafe impl<Manager> Sync for SessionRequest<Manager> {}
-unsafe impl<Manager> Send for SessionRequest<Manager> {}
+unsafe impl Sync for SessionRequest {}
+unsafe impl Send for SessionRequest {}
 
-impl<Manager> SessionRequest<Manager> {
+impl SessionRequest {
     /// The remote peer requesting the connection.
     pub fn remote(&self) -> &NetworkingIdentity {
         &self.remote
     }
 
     /// Accept the connection.
-    pub fn accept(self) {
+    pub fn accept(mut self) -> bool {
+        self.accepted = true;
         unsafe {
-            sys::SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(
+            return sys::SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(
                 self.messages,
                 self.remote.as_ptr(),
             );
@@ -317,8 +367,10 @@ impl<Manager> SessionRequest<Manager> {
     }
 }
 
-impl<Manager> Drop for SessionRequest<Manager> {
+impl Drop for SessionRequest {
     fn drop(&mut self) {
-        self.reject_inner();
+        if !self.accepted {
+            self.reject_inner();
+        }
     }
 }
