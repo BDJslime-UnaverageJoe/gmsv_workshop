@@ -19,3 +19,4 @@ rebuild-bindings = ["bindgen"]
 
 [build-dependencies]
 bindgen = { version = "0.69.2", optional = true }
+build_cfg = "1.1.0"
