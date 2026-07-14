@@ -16,7 +16,6 @@ default = []
 raw-bindings = []
 image = ["dep:image"]
 serde = ["dep:serde", "bitflags/serde"]
-raw-bindings = []
 refresh-bindgen = ["steamworks-sys/refresh-bindgen"]
 
 [dependencies]
