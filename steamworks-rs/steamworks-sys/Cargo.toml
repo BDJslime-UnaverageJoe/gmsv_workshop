@@ -12,10 +12,10 @@ rust-version = "1.80.0"
 
 [features]
 default = []
-refresh-bindgen = ["bindgen"]
+refresh-bindgen = []
 
 [dependencies]
 
 [build-dependencies]
-bindgen = { version = "0.69.2", optional = true }
+bindgen = { version = "0.69.2" }
 build_cfg = "1.1.0"
