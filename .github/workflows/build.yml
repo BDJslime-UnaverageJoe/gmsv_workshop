@@ -31,18 +31,14 @@ jobs:
         echo "CARGO_HOME=$HOME/.cargo" >> $GITHUB_ENV
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
     - name: Add targets
-      run: rustup target add x86_64-unknown-linux-gnu && rustup target add i686-unknown-linux-gnu
-    - name: Build 32-bit
-      run: export CC=$(which gcc) && cargo build --release --target i686-unknown-linux-gnu
+      run: rustup target add x86_64-unknown-linux-gnu
     - name: Build 64-bit
       run: cargo build --release --target x86_64-unknown-linux-gnu
     - name: Strip debug symbols
       run: |
-        strip target/i686-unknown-linux-gnu/release/libgmsv_workshop.so
         strip target/x86_64-unknown-linux-gnu/release/libgmsv_workshop.so
     - name: Rename binaries
       run: |
-        mv target/i686-unknown-linux-gnu/release/libgmsv_workshop.so target/i686-unknown-linux-gnu/release/gmsv_workshop_linux.dll
         mv target/x86_64-unknown-linux-gnu/release/libgmsv_workshop.so target/x86_64-unknown-linux-gnu/release/gmsv_workshop_linux64.dll
     - name: Release
       run: |
@@ -80,7 +76,7 @@ jobs:
         echo "Uploading assets to: $UPLOAD_URL"
 
         # Upload files
-        for file in target/x86_64-unknown-linux-gnu/release/gmsv_workshop_linux64.dll target/i686-unknown-linux-gnu/release/gmsv_workshop_linux.dll; do
+        for file in target/x86_64-unknown-linux-gnu/release/gmsv_workshop_linux64.dll; do
           if [ -f "$file" ]; then
             FILE_NAME=$(basename "$file")
             echo "Uploading: $FILE_NAME"
@@ -97,13 +93,9 @@ jobs:
     - name: Install nightly toolchain
       run: rustup toolchain install nightly-2025-03-08
     - name: Add targets
-      run: rustup target add x86_64-pc-windows-msvc && rustup target add i686-pc-windows-msvc
+      run: rustup target add x86_64-pc-windows-msvc
     - name: Build 64-bit
       run: cargo build --release --target x86_64-pc-windows-msvc --verbose
-      env:
-        RUSTFLAGS: -Ctarget-feature=+crt-static -v
-    - name: Build 32-bit
-      run: cargo build --release --target i686-pc-windows-msvc --verbose
       env:
         RUSTFLAGS: -Ctarget-feature=+crt-static -v
     - name: Rename binaries
@@ -115,7 +107,6 @@ jobs:
       with:
         tag_name: "v${{ github.run_number }}"
         files: |
-          target/i686-pc-windows-msvc/release/gmsv_workshop_win32.dll
           target/x86_64-pc-windows-msvc/release/gmsv_workshop_win64.dll
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
