@@ -1176,7 +1176,7 @@ checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
 
 [[package]]
 name = "steamworks"
-version = "0.8.0"
+version = "0.13.1"
 dependencies = [
  "bitflags 2.13.0",
  "image",

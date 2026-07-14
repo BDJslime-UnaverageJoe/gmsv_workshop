@@ -14,8 +14,6 @@ rust-version = "1.80.0"
 [features]
 default = []
 raw-bindings = []
-image = ["dep:image"]
-serde = ["dep:serde", "bitflags/serde"]
 refresh-bindgen = ["steamworks-sys/refresh-bindgen"]
 
 [dependencies]
