@@ -20,6 +20,6 @@ opt-level = "s"
 refresh-bindgen = ["steamworks/refresh-bindgen"]
 
 [dependencies]
-gmod = { version = "15", default-features = false }
+gmod = { version = "17.0.1", default-features = false }
 steamworks = { path = "./steamworks-rs", features = ["raw-bindings"] }
 gmod-lzma = "1.0.1"
